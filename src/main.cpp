@@ -134,8 +134,9 @@ void handle_serial_input()
                 digitalWrite(LED_BUILTIN, HIGH);
 
                 // Received ping (0x00 0xFF), respond with pong (0x01 0xFF)
-                Serial.write(0x01);
-                Serial.write(0xFF);
+                byte data[] = {0x01, 0xFF}; // Array con los bytes a enviar
+                Serial.write(data, sizeof(data));             
+                Serial.flush();
                 // Set LED colors as in original PING response
                 // analogWrite(MUTE_LED_BLUE, 0);
                 // analogWrite(MUTE_LED_GREEN, 255);
