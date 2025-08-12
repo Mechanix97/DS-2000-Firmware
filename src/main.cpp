@@ -21,7 +21,7 @@ volatile unsigned long lastInterruptTime = 0;
 
 void set_led_pwm()
 {
-    if (mute)
+    if (mute || deafen)
     {
         analogWrite(MUTE_LED_BLUE, muteLed.blue * muteLed.brightness / 255);
         analogWrite(MUTE_LED_GREEN, muteLed.green * muteLed.brightness / 255);
@@ -60,7 +60,6 @@ void handleVoiceSettings(char m, char d)
     // Implement command 1 functionality
     mute = (m != 0x00);
     deafen = (d != 0x00);
-    digitalWrite(PICO_DEFAULT_LED_PIN, mute);
 }
 
 void handleUnknown()
@@ -127,6 +126,7 @@ void muteButtonISR()
 
     if (currentTime - lastInterruptTime > DEBOUNCE_TIMEOUT)
     {
+        mute = !mute;
         lastInterruptTime = currentTime;
         byte data2[] = {0x02, 0x00, 0xFF};
         Serial.write(data2, sizeof(data2));
@@ -140,6 +140,7 @@ void deafenButtonISR()
 
     if (currentTime - lastInterruptTime > DEBOUNCE_TIMEOUT)
     {
+        deafen = !deafen;
         lastInterruptTime = currentTime;
         byte data2[] = {0x02, 0x01, 0xFF};
         Serial.write(data2, sizeof(data2));
