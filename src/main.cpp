@@ -2,7 +2,8 @@
 
 #include "pins.h"
 
-const uint DEBOUNCE_TIMEOUT = 200;
+const uint DEBOUNCE_TIMEOUT = 250;
+const uint SET_LED_INTERVAL = 250;
 
 typedef struct
 {
@@ -97,6 +98,23 @@ void handle_serial_input()
                 }
 
                 break;
+            case 0x04:
+                if (i > 2)
+                {
+                    muteLed.brightness = buf[1];
+                    deafLed.brightness = buf[1];
+                    // rgbMode=buf[2];
+                    if (buf[2] == 0x01 || buf[2] == 0x02)
+                    {
+                        muteLed.red = buf[3];
+                        muteLed.green = buf[4];
+                        muteLed.blue = buf[5];
+                        deafLed.red = buf[6];
+                        deafLed.green = buf[7];
+                        deafLed.blue = buf[8];
+                    }
+                }
+                break;
             default:
                 handleUnknown();
                 break;
@@ -126,11 +144,12 @@ void muteButtonISR()
 
     if (currentTime - lastInterruptTime > DEBOUNCE_TIMEOUT)
     {
-        mute = !mute;
+
         lastInterruptTime = currentTime;
         byte data2[] = {0x02, 0x00, 0xFF};
         Serial.write(data2, sizeof(data2));
         Serial.flush();
+        mute = !mute;
     }
 }
 
@@ -140,11 +159,11 @@ void deafenButtonISR()
 
     if (currentTime - lastInterruptTime > DEBOUNCE_TIMEOUT)
     {
-        deafen = !deafen;
         lastInterruptTime = currentTime;
         byte data2[] = {0x02, 0x01, 0xFF};
         Serial.write(data2, sizeof(data2));
         Serial.flush();
+        deafen = !deafen;
     }
 }
 
@@ -185,5 +204,6 @@ void setup()
 void loop()
 {
     handle_serial_input();
+
     set_led_pwm();
 }
