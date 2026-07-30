@@ -2,8 +2,37 @@
 
 #include "pins.h"
 
-const uint DEBOUNCE_TIMEOUT = 250;
-const uint SET_LED_INTERVAL = 250;
+/// Ignore further edges from the same button for this long after one is accepted.
+const unsigned long DEBOUNCE_TIMEOUT = 250;
+
+/// Message codes shared with the desktop application. Changing one breaks every device already
+/// flashed, so they are part of the contract rather than an implementation detail.
+enum MessageCode : uint8_t
+{
+    MSG_PING = 0x00,
+    MSG_PONG = 0x01,
+    MSG_BUTTON = 0x02,
+    MSG_VOICE_SETTINGS = 0x03,
+    MSG_RGB = 0x04,
+};
+
+enum ButtonId : uint8_t
+{
+    BUTTON_MUTE = 0x00,
+    BUTTON_DEAFEN = 0x01,
+    BUTTON_DISCONNECT = 0x02,
+};
+
+/// Frames are terminated by this byte, which is therefore not available inside a payload. The
+/// desktop side lowers any 255 to 254 for the same reason.
+const uint8_t FRAME_DELIMITER = 0xFF;
+
+enum RgbMode : uint8_t
+{
+    RGB_MODE_CYCLE = 0x00,
+    RGB_MODE_FIXED = 0x01,
+    RGB_MODE_WAVE = 0x02,
+};
 
 typedef struct
 {
@@ -18,165 +47,235 @@ LED_RGB_T deafLed = {255, 255, 255, 255};
 
 volatile bool mute = false;
 volatile bool deafen = false;
-volatile unsigned long lastInterruptTime = 0;
+
+/// Set by the interrupt handlers, acted on in loop().
+///
+/// The handlers used to write to Serial directly, but Serial.flush() blocks until the USB buffer
+/// drains and doing that inside an interrupt can stall the core or lose the write entirely. An
+/// interrupt should record what happened and return.
+volatile bool muteButtonPressed = false;
+volatile bool deafenButtonPressed = false;
+volatile bool disconnectButtonPressed = false;
+
+/// One timestamp per button. A single shared one meant pressing mute and then deafen within the
+/// debounce window silently dropped the second press.
+volatile unsigned long lastMuteInterrupt = 0;
+volatile unsigned long lastDeafenInterrupt = 0;
+volatile unsigned long lastDisconnectInterrupt = 0;
+
+/// Whether the LEDs need rewriting. Without it the PWM registers were rewritten on every pass of
+/// loop(), thousands of times a second, to keep showing the same colour.
+bool ledsDirty = true;
+
+void writeLed(uint8_t redPin, uint8_t greenPin, uint8_t bluePin, const LED_RGB_T &led, bool on)
+{
+    if (!on)
+    {
+        analogWrite(redPin, 0);
+        analogWrite(greenPin, 0);
+        analogWrite(bluePin, 0);
+        return;
+    }
+
+    analogWrite(redPin, led.red * led.brightness / 255);
+    analogWrite(greenPin, led.green * led.brightness / 255);
+    analogWrite(bluePin, led.blue * led.brightness / 255);
+}
 
 void set_led_pwm()
 {
-    if (mute || deafen)
+    if (!ledsDirty)
     {
-        analogWrite(MUTE_LED_BLUE, muteLed.blue * muteLed.brightness / 255);
-        analogWrite(MUTE_LED_GREEN, muteLed.green * muteLed.brightness / 255);
-        analogWrite(MUTE_LED_RED, muteLed.red * muteLed.brightness / 255);
+        return;
     }
-    else
-    {
-        analogWrite(MUTE_LED_BLUE, 0);
-        analogWrite(MUTE_LED_GREEN, 0);
-        analogWrite(MUTE_LED_RED, 0);
-    }
+    ledsDirty = false;
 
-    if (deafen)
-    {
-        analogWrite(DEAF_LED_BLUE, deafLed.blue * deafLed.brightness / 255);
-        analogWrite(DEAF_LED_GREEN, deafLed.green * deafLed.brightness / 255);
-        analogWrite(DEAF_LED_RED, deafLed.red * deafLed.brightness / 255);
-    }
-    else
-    {
-        analogWrite(DEAF_LED_BLUE, 0);
-        analogWrite(DEAF_LED_GREEN, 0);
-        analogWrite(DEAF_LED_RED, 0);
-    }
+    // Deafening implies muting, which is what Discord itself enforces, so the mute LED follows
+    // both.
+    writeLed(MUTE_LED_RED, MUTE_LED_GREEN, MUTE_LED_BLUE, muteLed, mute || deafen);
+    writeLed(DEAF_LED_RED, DEAF_LED_GREEN, DEAF_LED_BLUE, deafLed, deafen);
 }
 
-void handlePing()
+void sendFrame(const uint8_t *payload, size_t length)
 {
-    byte data[] = {0x01, 0xFF}; // Pong response
-    Serial.write(data, sizeof(data));
+    Serial.write(payload, length);
+    Serial.write(FRAME_DELIMITER);
     Serial.flush();
 }
 
-void handleVoiceSettings(char m, char d)
+void sendPong()
 {
-    // Implement command 1 functionality
-    mute = (m != 0x00);
-    deafen = (d != 0x00);
+    const uint8_t payload[] = {MSG_PONG};
+    sendFrame(payload, sizeof(payload));
 }
 
-void handleUnknown()
+void sendButton(uint8_t button)
 {
-    // Handle unknown command
+    const uint8_t payload[] = {MSG_BUTTON, button};
+    sendFrame(payload, sizeof(payload));
+}
+
+void handleVoiceSettings(uint8_t m, uint8_t d)
+{
+    bool newMute = (m != 0x00);
+    bool newDeafen = (d != 0x00);
+
+    if (newMute != mute || newDeafen != deafen)
+    {
+        mute = newMute;
+        deafen = newDeafen;
+        ledsDirty = true;
+    }
+}
+
+void handleRgb(const uint8_t *payload, uint8_t length)
+{
+    // brightness and mode.
+    if (length < 3)
+    {
+        return;
+    }
+
+    muteLed.brightness = payload[1];
+    deafLed.brightness = payload[1];
+
+    uint8_t mode = payload[2];
+    if (mode == RGB_MODE_FIXED || mode == RGB_MODE_WAVE)
+    {
+        // Six colour bytes follow. The previous check only required three bytes in total, so a
+        // truncated frame read past what had actually arrived.
+        if (length < 9)
+        {
+            return;
+        }
+
+        muteLed.red = payload[3];
+        muteLed.green = payload[4];
+        muteLed.blue = payload[5];
+        deafLed.red = payload[6];
+        deafLed.green = payload[7];
+        deafLed.blue = payload[8];
+    }
+
+    ledsDirty = true;
+}
+
+void dispatch(const uint8_t *payload, uint8_t length)
+{
+    // An empty frame is not a Ping. The buffer is zeroed after each frame and 0x00 happens to be
+    // the Ping code, so a stray delimiter used to answer with a Pong nobody asked for — which is
+    // exactly what the desktop app produced while it was sending its own delimiter twice.
+    if (length == 0)
+    {
+        return;
+    }
+
+    switch (payload[0])
+    {
+    case MSG_PING:
+        sendPong();
+        break;
+    case MSG_VOICE_SETTINGS:
+        if (length >= 3)
+        {
+            handleVoiceSettings(payload[1], payload[2]);
+        }
+        break;
+    case MSG_RGB:
+        handleRgb(payload, length);
+        break;
+    case MSG_PONG:
+    case MSG_BUTTON:
+        // Sent by this device, never received by it.
+        break;
+    default:
+        break;
+    }
 }
 
 void handle_serial_input()
 {
-    static char buf[30];
+    static uint8_t buf[32];
     static uint8_t i = 0;
 
     while (Serial.available())
     {
         uint8_t c = Serial.read();
 
-        if (c == 0xFF)
+        if (c == FRAME_DELIMITER)
         {
-            buf[i] = 0xFF;
-            switch (buf[0])
-            {
-            case 0x00: // Ping
-                handlePing();
-                break;
-            case 0x01: // Pong
-                // Do nothing
-                break;
-            case 0x02: // Button
-                // Do nothing
-                break;
-            case 0x03: // Voice Settings
-                if (i > 2)
-                {
-                    handleVoiceSettings(buf[1], buf[2]);
-                }
-
-                break;
-            case 0x04:
-                if (i > 2)
-                {
-                    muteLed.brightness = buf[1];
-                    deafLed.brightness = buf[1];
-                    // rgbMode=buf[2];
-                    if (buf[2] == 0x01 || buf[2] == 0x02)
-                    {
-                        muteLed.red = buf[3];
-                        muteLed.green = buf[4];
-                        muteLed.blue = buf[5];
-                        deafLed.red = buf[6];
-                        deafLed.green = buf[7];
-                        deafLed.blue = buf[8];
-                    }
-                }
-                break;
-            default:
-                handleUnknown();
-                break;
-            }
-
+            dispatch(buf, i);
             i = 0;
-            memset(buf, 0, sizeof(buf));
+            continue;
+        }
+
+        if (i < sizeof(buf))
+        {
+            buf[i++] = c;
         }
         else
         {
-            if (i < sizeof(buf) - 1)
-            {
-                buf[i++] = c;
-            }
-            else
-            {
-                i = 0;
-                memset(buf, 0, sizeof(buf));
-            }
+            // Oversized frame: drop it and resynchronise on the next delimiter.
+            i = 0;
         }
     }
 }
 
 void muteButtonISR()
 {
-    unsigned long currentTime = millis();
-
-    if (currentTime - lastInterruptTime > DEBOUNCE_TIMEOUT)
+    unsigned long now = millis();
+    if (now - lastMuteInterrupt > DEBOUNCE_TIMEOUT)
     {
-
-        lastInterruptTime = currentTime;
-        byte data2[] = {0x02, 0x00, 0xFF};
-        Serial.write(data2, sizeof(data2));
-        Serial.flush();
-        mute = !mute;
+        lastMuteInterrupt = now;
+        muteButtonPressed = true;
     }
 }
 
 void deafenButtonISR()
 {
-    unsigned long currentTime = millis();
-
-    if (currentTime - lastInterruptTime > DEBOUNCE_TIMEOUT)
+    unsigned long now = millis();
+    if (now - lastDeafenInterrupt > DEBOUNCE_TIMEOUT)
     {
-        lastInterruptTime = currentTime;
-        byte data2[] = {0x02, 0x01, 0xFF};
-        Serial.write(data2, sizeof(data2));
-        Serial.flush();
-        deafen = !deafen;
+        lastDeafenInterrupt = now;
+        deafenButtonPressed = true;
     }
 }
 
 void disconnectButtonISR()
 {
-    unsigned long currentTime = millis();
-
-    if (currentTime - lastInterruptTime > DEBOUNCE_TIMEOUT)
+    unsigned long now = millis();
+    if (now - lastDisconnectInterrupt > DEBOUNCE_TIMEOUT)
     {
-        lastInterruptTime = currentTime;
-        byte data2[] = {0x02, 0x02, 0xFF};
-        Serial.write(data2, sizeof(data2));
-        Serial.flush();
+        lastDisconnectInterrupt = now;
+        disconnectButtonPressed = true;
+    }
+}
+
+/// Reports the presses the interrupts recorded, and toggles locally so the LED follows the
+/// button even with no application connected. The app confirms or corrects it by sending back a
+/// voice settings message.
+void handle_buttons()
+{
+    if (muteButtonPressed)
+    {
+        muteButtonPressed = false;
+        mute = !mute;
+        ledsDirty = true;
+        sendButton(BUTTON_MUTE);
+    }
+
+    if (deafenButtonPressed)
+    {
+        deafenButtonPressed = false;
+        deafen = !deafen;
+        ledsDirty = true;
+        sendButton(BUTTON_DEAFEN);
+    }
+
+    if (disconnectButtonPressed)
+    {
+        disconnectButtonPressed = false;
+        sendButton(BUTTON_DISCONNECT);
     }
 }
 
@@ -204,6 +303,6 @@ void setup()
 void loop()
 {
     handle_serial_input();
-
+    handle_buttons();
     set_led_pwm();
 }
