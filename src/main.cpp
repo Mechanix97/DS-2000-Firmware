@@ -285,7 +285,8 @@ void setup()
     pinMode(DEAF_BUTTON, INPUT_PULLUP);
     pinMode(DISCONNECT_BUTTON, INPUT_PULLUP);
 
-    pinMode(LED_BUILTIN, OUTPUT);
+    // No LED_BUILTIN here: it was configured but never written to, and the board this runs on
+    // has a WS2812 on GPIO16 instead of a plain LED, so the constant does not even exist for it.
     pinMode(MUTE_LED_RED, OUTPUT);
     pinMode(MUTE_LED_GREEN, OUTPUT);
     pinMode(MUTE_LED_BLUE, OUTPUT);
