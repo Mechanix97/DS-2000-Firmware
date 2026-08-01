@@ -31,7 +31,7 @@ enum RgbMode : uint8_t
 {
     RGB_MODE_CYCLE = 0x00,
     RGB_MODE_FIXED = 0x01,
-    RGB_MODE_WAVE = 0x02,
+    RGB_MODE_BREATHING = 0x02,
 };
 
 typedef struct
@@ -71,7 +71,7 @@ bool ledsDirty = true;
 ///
 /// This used to be a local inside handleRgb, read only to decide whether six colour bytes
 /// followed. Nothing remembered it, so the animated modes had nowhere to live: cycle froze on the
-/// last colour it happened to be given and wave was indistinguishable from fixed.
+/// last colour it happened to be given and breathing was indistinguishable from fixed.
 uint8_t rgbMode = RGB_MODE_FIXED;
 
 /// When the last animation frame was drawn, so the animated modes advance on wall-clock time
@@ -136,7 +136,7 @@ uint8_t breathLevel(unsigned long now)
 void set_led_pwm()
 {
     const unsigned long now = millis();
-    const bool animated = (rgbMode == RGB_MODE_CYCLE || rgbMode == RGB_MODE_WAVE);
+    const bool animated = (rgbMode == RGB_MODE_CYCLE || rgbMode == RGB_MODE_BREATHING);
 
     if (animated)
     {
@@ -168,7 +168,7 @@ void set_led_pwm()
         second.green = first.green;
         second.blue = first.blue;
     }
-    else if (rgbMode == RGB_MODE_WAVE)
+    else if (rgbMode == RGB_MODE_BREATHING)
     {
         // Breathing keeps the configured colour and modulates only the brightness, on top of the
         // level the application asked for rather than replacing it.
@@ -224,7 +224,7 @@ void handleRgb(const uint8_t *payload, uint8_t length)
     }
 
     const uint8_t mode = payload[2];
-    if (mode != RGB_MODE_CYCLE && mode != RGB_MODE_FIXED && mode != RGB_MODE_WAVE)
+    if (mode != RGB_MODE_CYCLE && mode != RGB_MODE_FIXED && mode != RGB_MODE_BREATHING)
     {
         // Drop the whole frame rather than adopt half of it: a mode byte this side does not know
         // means the desktop application is ahead of this firmware, and guessing would leave the
@@ -236,7 +236,7 @@ void handleRgb(const uint8_t *payload, uint8_t length)
     deafLed.brightness = payload[1];
     rgbMode = mode;
 
-    if (mode == RGB_MODE_FIXED || mode == RGB_MODE_WAVE)
+    if (mode == RGB_MODE_FIXED || mode == RGB_MODE_BREATHING)
     {
         // Six colour bytes follow. The previous check only required three bytes in total, so a
         // truncated frame read past what had actually arrived.
