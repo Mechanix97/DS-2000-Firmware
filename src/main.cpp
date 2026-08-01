@@ -29,7 +29,7 @@ const uint8_t FRAME_DELIMITER = 0xFF;
 
 enum RgbMode : uint8_t
 {
-    RGB_MODE_CYCLE = 0x00,
+    RGB_MODE_RAINBOW = 0x00,
     RGB_MODE_FIXED = 0x01,
     RGB_MODE_BREATHING = 0x02,
 };
@@ -70,8 +70,8 @@ bool ledsDirty = true;
 /// The mode the application last asked for.
 ///
 /// This used to be a local inside handleRgb, read only to decide whether six colour bytes
-/// followed. Nothing remembered it, so the animated modes had nowhere to live: cycle froze on the
-/// last colour it happened to be given and breathing was indistinguishable from fixed.
+/// followed. Nothing remembered it, so the animated modes had nowhere to live: the rainbow froze
+/// on the last colour it happened to be given and breathing was indistinguishable from fixed.
 uint8_t rgbMode = RGB_MODE_FIXED;
 
 /// When the last animation frame was drawn, so the animated modes advance on wall-clock time
@@ -81,9 +81,23 @@ unsigned long lastAnimationFrame = 0;
 /// 60 Hz. Smooth to the eye, and still leaves the loop overwhelmingly idle.
 const unsigned long ANIMATION_INTERVAL = 16;
 
-/// How long one full hue sweep and one full inhale-exhale take.
-const unsigned long CYCLE_PERIOD = 6000;
-const unsigned long BREATH_PERIOD = 3000;
+/// How fast the animated modes run, as the application last set it. Higher is faster.
+///
+/// 128 is the midpoint and reproduces the periods this firmware used before the control existed,
+/// so a device that never hears from the application still behaves the way it always did.
+uint8_t rgbSpeed = 128;
+
+/// The speed byte cannot reach 255: that value is the frame delimiter.
+const uint8_t SPEED_MAX = 254;
+
+/// Bounds for one full hue sweep and one full inhale-exhale, slowest to fastest.
+///
+/// Breathing runs to a shorter floor than the rainbow. A lap of the colour wheel stays legible
+/// far quicker than a fade does, which starts reading as a flicker rather than a breath.
+const unsigned long RAINBOW_PERIOD_SLOWEST = 12000;
+const unsigned long RAINBOW_PERIOD_FASTEST = 1000;
+const unsigned long BREATH_PERIOD_SLOWEST = 6000;
+const unsigned long BREATH_PERIOD_FASTEST = 600;
 
 void writeLed(uint8_t redPin, uint8_t greenPin, uint8_t bluePin, const LED_RGB_T &led, bool on)
 {
@@ -121,6 +135,16 @@ void hueToRgb(uint16_t hue, uint8_t &red, uint8_t &green, uint8_t &blue)
     }
 }
 
+/// Turns the speed byte into a period, in milliseconds.
+///
+/// Inverted, because the control is a speed and the animation needs a duration: turning it up has
+/// to shorten the lap, not stretch it.
+unsigned long periodFor(unsigned long slowest, unsigned long fastest)
+{
+    const uint8_t speed = rgbSpeed > SPEED_MAX ? SPEED_MAX : rgbSpeed;
+    return slowest - (unsigned long)speed * (slowest - fastest) / SPEED_MAX;
+}
+
 /// Where in the breath we are, 0 (dark) to 255 (full).
 ///
 /// The triangle is squared because perceived brightness is nowhere near linear in duty cycle: a
@@ -128,7 +152,8 @@ void hueToRgb(uint16_t hue, uint8_t &red, uint8_t &green, uint8_t &blue)
 /// does not look like breathing.
 uint8_t breathLevel(unsigned long now)
 {
-    const uint16_t phase = (uint32_t)(now % BREATH_PERIOD) * 512 / BREATH_PERIOD;
+    const unsigned long period = periodFor(BREATH_PERIOD_SLOWEST, BREATH_PERIOD_FASTEST);
+    const uint16_t phase = (uint32_t)(now % period) * 512 / period;
     const uint8_t triangle = phase < 256 ? phase : 511 - phase;
     return (uint16_t)triangle * triangle / 255;
 }
@@ -136,7 +161,7 @@ uint8_t breathLevel(unsigned long now)
 void set_led_pwm()
 {
     const unsigned long now = millis();
-    const bool animated = (rgbMode == RGB_MODE_CYCLE || rgbMode == RGB_MODE_BREATHING);
+    const bool animated = (rgbMode == RGB_MODE_RAINBOW || rgbMode == RGB_MODE_BREATHING);
 
     if (animated)
     {
@@ -157,12 +182,13 @@ void set_led_pwm()
     LED_RGB_T first = muteLed;
     LED_RGB_T second = deafLed;
 
-    if (rgbMode == RGB_MODE_CYCLE)
+    if (rgbMode == RGB_MODE_RAINBOW)
     {
-        // Cycle owns the colour, so whatever was last configured is ignored while it runs. Both
-        // LEDs share a hue: with only two of them, offsetting them reads as a fault rather than
-        // as an effect.
-        const uint16_t hue = (uint32_t)(now % CYCLE_PERIOD) * 1536 / CYCLE_PERIOD;
+        // The rainbow owns the colour, so whatever was last configured is ignored while it runs.
+        // Both LEDs share a hue: with only two of them, offsetting them reads as a fault rather
+        // than as an effect.
+        const unsigned long period = periodFor(RAINBOW_PERIOD_SLOWEST, RAINBOW_PERIOD_FASTEST);
+        const uint16_t hue = (uint32_t)(now % period) * 1536 / period;
         hueToRgb(hue, first.red, first.green, first.blue);
         second.red = first.red;
         second.green = first.green;
@@ -217,14 +243,14 @@ void handleVoiceSettings(uint8_t m, uint8_t d)
 
 void handleRgb(const uint8_t *payload, uint8_t length)
 {
-    // brightness and mode.
-    if (length < 3)
+    // Brightness, mode and speed. The six colour bytes follow only for the modes that use them.
+    if (length < 4)
     {
         return;
     }
 
     const uint8_t mode = payload[2];
-    if (mode != RGB_MODE_CYCLE && mode != RGB_MODE_FIXED && mode != RGB_MODE_BREATHING)
+    if (mode != RGB_MODE_RAINBOW && mode != RGB_MODE_FIXED && mode != RGB_MODE_BREATHING)
     {
         // Drop the whole frame rather than adopt half of it: a mode byte this side does not know
         // means the desktop application is ahead of this firmware, and guessing would leave the
@@ -232,25 +258,28 @@ void handleRgb(const uint8_t *payload, uint8_t length)
         return;
     }
 
+    const bool carriesColours = (mode == RGB_MODE_FIXED || mode == RGB_MODE_BREATHING);
+    if (carriesColours && length < 10)
+    {
+        return;
+    }
+
+    // Nothing is written until every check has passed. Validating as it went meant a truncated
+    // frame still landed its brightness and mode before bailing out, leaving the device lit by
+    // half a message it had already rejected.
     muteLed.brightness = payload[1];
     deafLed.brightness = payload[1];
     rgbMode = mode;
+    rgbSpeed = payload[3];
 
-    if (mode == RGB_MODE_FIXED || mode == RGB_MODE_BREATHING)
+    if (carriesColours)
     {
-        // Six colour bytes follow. The previous check only required three bytes in total, so a
-        // truncated frame read past what had actually arrived.
-        if (length < 9)
-        {
-            return;
-        }
-
-        muteLed.red = payload[3];
-        muteLed.green = payload[4];
-        muteLed.blue = payload[5];
-        deafLed.red = payload[6];
-        deafLed.green = payload[7];
-        deafLed.blue = payload[8];
+        muteLed.red = payload[4];
+        muteLed.green = payload[5];
+        muteLed.blue = payload[6];
+        deafLed.red = payload[7];
+        deafLed.green = payload[8];
+        deafLed.blue = payload[9];
     }
 
     ledsDirty = true;
