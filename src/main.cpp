@@ -67,6 +67,24 @@ volatile unsigned long lastDisconnectInterrupt = 0;
 /// loop(), thousands of times a second, to keep showing the same colour.
 bool ledsDirty = true;
 
+/// The mode the application last asked for.
+///
+/// This used to be a local inside handleRgb, read only to decide whether six colour bytes
+/// followed. Nothing remembered it, so the animated modes had nowhere to live: cycle froze on the
+/// last colour it happened to be given and wave was indistinguishable from fixed.
+uint8_t rgbMode = RGB_MODE_FIXED;
+
+/// When the last animation frame was drawn, so the animated modes advance on wall-clock time
+/// rather than on however fast loop() happens to spin.
+unsigned long lastAnimationFrame = 0;
+
+/// 60 Hz. Smooth to the eye, and still leaves the loop overwhelmingly idle.
+const unsigned long ANIMATION_INTERVAL = 16;
+
+/// How long one full hue sweep and one full inhale-exhale take.
+const unsigned long CYCLE_PERIOD = 6000;
+const unsigned long BREATH_PERIOD = 3000;
+
 void writeLed(uint8_t redPin, uint8_t greenPin, uint8_t bluePin, const LED_RGB_T &led, bool on)
 {
     if (!on)
@@ -82,18 +100,87 @@ void writeLed(uint8_t redPin, uint8_t greenPin, uint8_t bluePin, const LED_RGB_T
     analogWrite(bluePin, led.blue * led.brightness / 255);
 }
 
+/// Full-saturation colour for a hue in 0..1535.
+///
+/// Six 256-wide sectors of the colour wheel, walked with integer arithmetic. A real HSV
+/// conversion would need floating point for no visible gain: at 256 steps per sector the
+/// staircase is already finer than the LED can resolve.
+void hueToRgb(uint16_t hue, uint8_t &red, uint8_t &green, uint8_t &blue)
+{
+    const uint8_t sector = hue / 256;
+    const uint8_t offset = hue % 256;
+
+    switch (sector)
+    {
+    case 0:  red = 255;          green = offset;       blue = 0;            break;
+    case 1:  red = 255 - offset; green = 255;          blue = 0;            break;
+    case 2:  red = 0;            green = 255;          blue = offset;       break;
+    case 3:  red = 0;            green = 255 - offset; blue = 255;          break;
+    case 4:  red = offset;       green = 0;            blue = 255;          break;
+    default: red = 255;          green = 0;            blue = 255 - offset; break;
+    }
+}
+
+/// Where in the breath we are, 0 (dark) to 255 (full).
+///
+/// The triangle is squared because perceived brightness is nowhere near linear in duty cycle: a
+/// bare triangle reads as a hard bounce at the top and a long dead stretch at the bottom, which
+/// does not look like breathing.
+uint8_t breathLevel(unsigned long now)
+{
+    const uint16_t phase = (uint32_t)(now % BREATH_PERIOD) * 512 / BREATH_PERIOD;
+    const uint8_t triangle = phase < 256 ? phase : 511 - phase;
+    return (uint16_t)triangle * triangle / 255;
+}
+
 void set_led_pwm()
 {
-    if (!ledsDirty)
+    const unsigned long now = millis();
+    const bool animated = (rgbMode == RGB_MODE_CYCLE || rgbMode == RGB_MODE_WAVE);
+
+    if (animated)
+    {
+        // Rate-limited rather than dirty-checked: an animation is never done changing, so it
+        // drives the PWM on a clock of its own instead of waiting to be told something moved.
+        if (now - lastAnimationFrame < ANIMATION_INTERVAL)
+        {
+            return;
+        }
+        lastAnimationFrame = now;
+    }
+    else if (!ledsDirty)
     {
         return;
     }
     ledsDirty = false;
 
+    LED_RGB_T first = muteLed;
+    LED_RGB_T second = deafLed;
+
+    if (rgbMode == RGB_MODE_CYCLE)
+    {
+        // Cycle owns the colour, so whatever was last configured is ignored while it runs. Both
+        // LEDs share a hue: with only two of them, offsetting them reads as a fault rather than
+        // as an effect.
+        const uint16_t hue = (uint32_t)(now % CYCLE_PERIOD) * 1536 / CYCLE_PERIOD;
+        hueToRgb(hue, first.red, first.green, first.blue);
+        second.red = first.red;
+        second.green = first.green;
+        second.blue = first.blue;
+    }
+    else if (rgbMode == RGB_MODE_WAVE)
+    {
+        // Breathing keeps the configured colour and modulates only the brightness, on top of the
+        // level the application asked for rather than replacing it.
+        const uint8_t level = breathLevel(now);
+        first.brightness = (uint16_t)first.brightness * level / 255;
+        second.brightness = (uint16_t)second.brightness * level / 255;
+    }
+
     // Deafening implies muting, which is what Discord itself enforces, so the mute LED follows
     // both.
-    writeLed(MUTE_LED_RED, MUTE_LED_GREEN, MUTE_LED_BLUE, muteLed, mute || deafen);
-    writeLed(DEAF_LED_RED, DEAF_LED_GREEN, DEAF_LED_BLUE, deafLed, deafen);
+    writeLed(MUTE_LED_RED, MUTE_LED_GREEN, MUTE_LED_BLUE, first, mute || deafen);
+    writeLed(DEAF_LED_RED, DEAF_LED_GREEN, DEAF_LED_BLUE, second, deafen);
 }
 
 void sendFrame(const uint8_t *payload, size_t length)
@@ -136,10 +223,19 @@ void handleRgb(const uint8_t *payload, uint8_t length)
         return;
     }
 
+    const uint8_t mode = payload[2];
+    if (mode != RGB_MODE_CYCLE && mode != RGB_MODE_FIXED && mode != RGB_MODE_WAVE)
+    {
+        // Drop the whole frame rather than adopt half of it: a mode byte this side does not know
+        // means the desktop application is ahead of this firmware, and guessing would leave the
+        // brightness applied under an effect that was never asked for.
+        return;
+    }
+
     muteLed.brightness = payload[1];
     deafLed.brightness = payload[1];
+    rgbMode = mode;
 
-    uint8_t mode = payload[2];
     if (mode == RGB_MODE_FIXED || mode == RGB_MODE_WAVE)
     {
         // Six colour bytes follow. The previous check only required three bytes in total, so a
